@@ -1,0 +1,332 @@
+diff --git a/App/NativeReceiver.swift b/App/NativeReceiver.swift
+index c30941f..4d5d4a2 100644
+--- a/App/NativeReceiver.swift
++++ b/App/NativeReceiver.swift
+@@ -159,7 +159,8 @@ final class NativeReceiver {
+             self.listen(configuration: configuration, identity: identity, port: configuration.port, onReady: listening)
+         }
+     }
+-    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16) -> Void)?) {
++    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?,
++                        onReady: ((UInt16) -> Void)?, attempt: Int = 0) {
+         let generation = self.generation
+         do {
+             let candidate = try NWListener(using: .tcp, on: port.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any)
+@@ -194,9 +195,9 @@ final class NativeReceiver {
+                     }
+                 case .failed(let error):
+                     if port != nil, case .posix(.EADDRINUSE) = error {
+-                        self.log("端口 \(port!) 已被占用，正在申请可用端口")
+                         candidate.cancel(); self.listener = nil
+-                        self.listen(configuration: configuration, identity: identity, port: nil, onReady: onReady)
++                        self.retryListen(configuration: configuration, identity: identity, port: port!,
++                                         onReady: onReady, attempt: attempt + 1)
+                     } else { self.fail("监听器失败：\(error.localizedDescription)") }
+                 default: break
+                 }
+@@ -225,11 +226,28 @@ final class NativeReceiver {
+             candidate.start(queue: queue)
+         } catch let error as NWError {
+             if port != nil, case .posix(.EADDRINUSE) = error {
+-                log("端口 \(port!) 已被占用，正在申请可用端口")
+-                listen(configuration: configuration, identity: identity, port: nil, onReady: onReady)
++                retryListen(configuration: configuration, identity: identity, port: port!,
++                            onReady: onReady, attempt: attempt + 1)
+             } else { fail("无法创建监听器：\(error.localizedDescription)") }
+         } catch { fail("无法创建监听器：\(error)") }
+     }
++    /// Reusing the requested port keeps the iAP2 start-session address unambiguous. Falling back
++    /// while an older CarWithin accessory is still alive makes iPhone 16 select that stale session.
++    private func retryListen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16,
++                             onReady: ((UInt16) -> Void)?, attempt: Int) {
++        let run = generation
++        guard attempt <= 4 else {
++            fail("端口 \(port) 被另一 CarWithin 实例占用。请完整退出旧实例、重新启动 App 后再试。")
++            return
++        }
++        let delay = min(4, 0.5 * Double(attempt))
++        log("端口 \(port) 暂被占用，\(String(format: "%.1f", delay)) 秒后重试（\(attempt)/4）")
++        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
++            guard let self, self.generation == run else { return }
++            self.listen(configuration: configuration, identity: identity, port: port,
++                        onReady: onReady, attempt: attempt)
++        }
++    }
+     private func fail(_ message: String) {
+         log(message); stopOnQueue()
+         DispatchQueue.main.async { [weak self] in self?.onFailure?() }
+diff --git a/App/ReceiverViewController.swift b/App/ReceiverViewController.swift
+index aa4de76..734d0ee 100644
+--- a/App/ReceiverViewController.swift
++++ b/App/ReceiverViewController.swift
+@@ -1452,7 +1452,8 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate
+                 guard let self, self.running, self.localStartupID == startupID else { return }
+                 var live = config; live.port = port
+                 self.controlBrowser.start()
+-                self.sameDevice.start(configuration: live, identity: identity)
++                self.sameDevice.start(configuration: live, identity: identity,
++                    airPlayPublicKey: self.airPlayPublicKeyHex)
+             }
+             prepareExternalOutput(configuration: config)
+             receiver.start(configuration: config, identity: identity, preferredViewer: primaryViewer)
+@@ -1493,6 +1494,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate
+         outputMode.usesInstrumentWiFi ? ReceiverConfiguration.wifiIPv4Address() : browserAddress
+     }
+ 
++    /// Wireless CarPlay's 0x4301 identity. Loading the persisted key is idempotent and keeps
++    /// the iAP2 request aligned with the AirPlay Bonjour key iPhone expects.
++    private var airPlayPublicKeyHex: String? {
++        guard let credentials = try? AirPlayCredentials() else { return nil }
++        return credentials.signingKey.publicKey.rawRepresentation
++            .map { String(format: "%02x", $0) }.joined()
++    }
++
+     private func refreshNetworkAddresses() {
+         refreshBrowserAddressLabels()
+     }
+@@ -1532,19 +1541,25 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate
+         networkStartupTask = Task { [weak self] in
+             var candidate: String?
+             var stableSamples = 0
+-            var lostAddress = false
++            var missingSamples = 0
+             for _ in 0..<90 {
+                 try? await Task.sleep(nanoseconds: 500_000_000)
+                 guard !Task.isCancelled, let self, self.running, !self.displayedVideo else { return }
+                 let address = self.localCarPlayAddress
+                 self.refreshNetworkAddresses()
+-                if address == nil { lostAddress = true }
+                 if address != candidate { candidate = address; stableSamples = 0 }
+                 stableSamples += 1
+-                guard let address, address != initialAddress || lostAddress, stableSamples >= 3,
++                if address == nil { missingSamples += 1 } else { missingSamples = 0 }
++                // Ignore a single route flap. Restart only after the address has remained
++                // different for three seconds, or has genuinely been absent for six seconds.
++                let changed = address != nil && address != initialAddress && stableSamples >= 6
++                let missing = address == nil && missingSamples >= 12
++                guard changed || missing,
+                       self.networkRestartCount < 2, UIApplication.shared.applicationState == .active else { continue }
+                 self.networkRestartCount += 1
+-                self.log("启动期间 Wi-Fi 已切换或恢复，使用当前地址重新连接 CarPlay")
++                self.log(missing
++                    ? "启动期间 Wi-Fi 地址连续 6 秒缺失，重新连接 CarPlay"
++                    : "启动期间 Wi-Fi 地址已稳定切换，使用当前地址重新连接 CarPlay")
+                 self.stop()
+                 self.restartingAutomatically = true
+                 self.toggleReceiver()
+diff --git a/App/SameDeviceProbe.swift b/App/SameDeviceProbe.swift
+index 0df7c4b..a4ea2ea 100644
+--- a/App/SameDeviceProbe.swift
++++ b/App/SameDeviceProbe.swift
+@@ -15,6 +15,7 @@ final class SameDeviceProbe {
+     private var session: UInt8 = 1
+     private var identity: AccessoryIdentity?
+     private var configuration: ReceiverConfiguration?
++    private var airPlayPublicKey = ""
+     private var messageBytes = Data()
+     private var requested = false
+     private var controlConnected = false
+@@ -23,8 +24,10 @@ final class SameDeviceProbe {
+     var onFinished: ((String) -> Void)?
+     var onStage: ((String) -> Void)?
+ 
+-    func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity, expectsLocalControl: Bool = true) {
++    func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity,
++               airPlayPublicKey: String? = nil, expectsLocalControl: Bool = true) {
+         stop(); active = true; self.identity = identity; self.configuration = configuration
++        self.airPlayPublicKey = airPlayPublicKey ?? ""
+         self.expectsLocalControl = expectsLocalControl
+         let run = generation
+         transport.onData = { [weak self] data in self?.receive(data) }
+@@ -53,7 +56,8 @@ final class SameDeviceProbe {
+     }
+     func stop() {
+         active = false; generation = UUID(); transport.stop(); transport.onData = nil; parser = IAP2Parser()
+-        identity = nil; configuration = nil; messageBytes = Data(); sequence = 0x10; acknowledgement = 0
++        identity = nil; configuration = nil; airPlayPublicKey = ""; messageBytes = Data()
++        sequence = 0x10; acknowledgement = 0
+         session = 1; lastPayloadSequence = nil; linked = false; authenticated = false; identified = false; requested = false; controlConnected = false
+     }
+     func didConnectControl() {
+@@ -64,7 +68,7 @@ final class SameDeviceProbe {
+     private func requestSession(_ configuration: ReceiverConfiguration) throws {
+         let wifi = try AccessoryMessages.WiFi(ssid: configuration.ssid, password: configuration.password, channel: configuration.wifiChannel)
+         try send(AccessoryMessages.startSession(address: configuration.address, port: configuration.port,
+-            deviceID: configuration.deviceID, wifi: wifi))
++            deviceID: configuration.deviceID, wifi: wifi, publicKey: airPlayPublicKey))
+     }
+     private func stage(_ message: String) { onLog?(message); onStage?(message) }
+     private func finish(_ message: String) { onLog?(message); stop(); onFinished?(message) }
+@@ -139,7 +143,9 @@ final class SameDeviceProbe {
+             try requestSession(configuration)
+             if !requested && expectsLocalControl {
+                 let run = generation
+-                for delay in [3.0, 6.0, 9.0] {
++                // iOS 16 can take longer than nine seconds to select the Wireless CarPlay transport.
++                // Keep asking until the control timeout instead of leaving the phone without a request.
++                for delay in stride(from: 3.0, through: 42.0, by: 3.0) {
+                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                         guard let self, self.active, self.generation == run, !self.controlConnected else { return }
+                         do { try self.requestSession(configuration) }
+@@ -151,6 +157,12 @@ final class SameDeviceProbe {
+             stage(expectsLocalControl
+                 ? "已请求在 \(configuration.address):\(configuration.port) 启动 CarPlay，会话正在等待 TCP 连接"
+                 : "已向 \(configuration.name)（\(configuration.address):\(configuration.port)）请求 CarPlay。请保持此 App 运行并查看 iPad 画面。")
++        case 0x5702, 0x4e0e:
++            // iOS 16 asks for accessory Wi-Fi details independently of CarPlayStartSession.
++            let wifi = try AccessoryMessages.WiFi(ssid: configuration.ssid, password: configuration.password,
++                channel: configuration.wifiChannel)
++            try send(AccessoryMessages.accessoryWiFiConfiguration(wifi))
++            onLog?(String(format: "已响应 iAP2 Wi-Fi 配置请求 0x%04X", message.id))
+         default: onLog?(String(format: "未处理的配件消息 0x%04X", message.id))
+         }
+     }
+diff --git a/App/VideoOutputServer.swift b/App/VideoOutputServer.swift
+index 8ea457a..0b61e27 100644
+--- a/App/VideoOutputServer.swift
++++ b/App/VideoOutputServer.swift
+@@ -204,7 +204,8 @@ final class VideoOutputServer {
+         } catch { report("低延迟 HTTPS 接收页未开启：\(error.localizedDescription)") }
+     }
+ 
+-    private func makeListener(port: UInt16, parameters: NWParameters, secure: Bool, run: UUID) -> NWListener? {
++    private func makeListener(port: UInt16, parameters: NWParameters, secure: Bool, run: UUID,
++                              attempt: Int = 0) -> NWListener? {
+         let name = hls == nil ? (secure ? "低延迟 HTTPS 接收页" : "浏览器接收页") : "AirPlay 播放服务"
+         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { report("\(name)端口无效"); return nil }
+         do {
+@@ -215,9 +216,15 @@ final class VideoOutputServer {
+                 switch state {
+                 case .ready: self.report("\(name)已开启，端口 \(port)")
+                 case .failed(let error):
+-                    self.report("\(name)启动失败：\(error.localizedDescription)")
+                     candidate.cancel()
+-                    if secure { self.secureListener = nil; self.securePort = nil; self.httpsRoot = nil } else { self.listener = nil }
++                    if secure { self.secureListener = nil } else { self.listener = nil }
++                    if case .posix(.EADDRINUSE) = error {
++                        self.retryListener(port: port, parameters: parameters, secure: secure, run: run,
++                                           attempt: attempt + 1)
++                    } else {
++                        if secure { self.securePort = nil; self.httpsRoot = nil }
++                        self.report("\(name)启动失败：\(error.localizedDescription)")
++                    }
+                 default: break
+                 }
+             }
+@@ -228,7 +235,42 @@ final class VideoOutputServer {
+             }
+             candidate.start(queue: queue)
+             return candidate
+-        } catch { report("\(name)启动失败：\(error.localizedDescription)"); return nil }
++        } catch let error as NWError {
++            if case .posix(.EADDRINUSE) = error {
++                retryListener(port: port, parameters: parameters, secure: secure, run: run, attempt: attempt + 1)
++            } else {
++                report("\(name)启动失败：\(error.localizedDescription)")
++            }
++            return nil
++        } catch {
++            report("\(name)启动失败：\(error.localizedDescription)")
++            return nil
++        }
++    }
++
++    /// Listener cancellation is asynchronous. Retry briefly so an in-process restart does not
++    /// keep the browser on a stale page merely because the previous socket has not closed yet.
++    private func retryListener(port: UInt16, parameters: NWParameters, secure: Bool, run: UUID, attempt: Int) {
++        let name = hls == nil ? (secure ? "低延迟 HTTPS 接收页" : "浏览器接收页") : "AirPlay 播放服务"
++        guard attempt <= 4, generation == run else {
++            if secure { secureListener = nil; securePort = nil; httpsRoot = nil } else { listener = nil }
++            report("\(name)端口 \(port) 仍被占用，请完整退出旧 CarWithin 进程或更换端口")
++            return
++        }
++        let delay = min(4, 0.5 * Double(attempt))
++        report("\(name)端口 \(port) 暂被占用，\(String(format: "%.1f", delay)) 秒后重试（\(attempt)/4）")
++        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
++            guard let self, self.generation == run else { return }
++            if secure {
++                guard self.secureListener == nil else { return }
++                self.secureListener = self.makeListener(port: port, parameters: parameters, secure: true,
++                                                        run: run, attempt: attempt)
++            } else {
++                guard self.listener == nil else { return }
++                self.listener = self.makeListener(port: port, parameters: parameters, secure: false,
++                                                  run: run, attempt: attempt)
++            }
++        }
+     }
+ 
+     private func accept(_ connection: NWConnection, secure: Bool) {
+diff --git a/Sources/TDSCarKitCore/AccessoryMessages.swift b/Sources/TDSCarKitCore/AccessoryMessages.swift
+index 1a94bcc..0d4e177 100644
+--- a/Sources/TDSCarKitCore/AccessoryMessages.swift
++++ b/Sources/TDSCarKitCore/AccessoryMessages.swift
+@@ -37,7 +37,9 @@ public enum AccessoryMessages {
+             IAP2Parameter(id: 2, value: Data()), IAP2Parameter(id: 4, value: Data())]))
+         return IAP2Message(id: 0x1d01, parameters: fields)
+     }
+-    public static func startSession(address: String, port: UInt16, deviceID: String, wifi: WiFi? = nil) throws -> IAP2Message {
++    public static func startSession(address: String, port: UInt16, deviceID: String, wifi: WiFi? = nil,
++                                    publicKey: String = "") throws -> IAP2Message {
++        guard !publicKey.contains("\0") else { throw ProtocolError.malformed("AirPlay public key") }
+         // sendCarPlayStartSessionManual calls appendU32TLV for parameter 2.
+         let portBytes = Data([0, 0, UInt8(truncatingIfNeeded: port >> 8), UInt8(truncatingIfNeeded: port)])
+         var fields = [try group(0, [string(0, address)])]
+@@ -47,7 +49,20 @@ public enum AccessoryMessages {
+                 IAP2Parameter(id: 2, value: Data([wifi.channel])), string(3, address),
+                 IAP2Parameter(id: 4, value: Data([wifi.password.isEmpty ? 0 : 2]))]))
+         }
+-        fields += [IAP2Parameter(id: 2, value: portBytes), string(3, deviceID), string(4, ""), string(5, "509.11")]
++        // iOS 16 expects the AirPlay identity here. Newer releases tolerate an empty value,
++        // but omitting it can leave the wireless CarPlay control connection unmade.
++        fields += [IAP2Parameter(id: 2, value: portBytes), string(3, deviceID), string(4, publicKey), string(5, "509.11")]
+         return IAP2Message(id: 0x4301, parameters: fields)
+     }
++
++    /// Reply to iPhone's 0x5702 accessory Wi-Fi configuration request.
++    public static func accessoryWiFiConfiguration(_ wifi: WiFi, bssid: Data = Data()) throws -> IAP2Message {
++        guard bssid.isEmpty || bssid.count == 6 else { throw ProtocolError.malformed("Wi-Fi BSSID") }
++        var fields = [IAP2Parameter]()
++        if !bssid.isEmpty { fields.append(IAP2Parameter(id: 0, value: bssid)) }
++        fields += [string(1, wifi.ssid), string(2, wifi.password),
++                   IAP2Parameter(id: 3, value: Data([wifi.password.isEmpty ? 0 : 2])),
++                   IAP2Parameter(id: 4, value: Data([wifi.channel]))]
++        return IAP2Message(id: 0x5703, parameters: fields)
++    }
+ }
+diff --git a/Tests/TDSCarKitCoreTests/AccessoryMessagesTests.swift b/Tests/TDSCarKitCoreTests/AccessoryMessagesTests.swift
+index 9c9cf6e..b0295e2 100644
+--- a/Tests/TDSCarKitCoreTests/AccessoryMessagesTests.swift
++++ b/Tests/TDSCarKitCoreTests/AccessoryMessagesTests.swift
+@@ -26,16 +26,30 @@ final class AccessoryMessagesTests: XCTestCase {
+         XCTAssertThrowsError(try AccessoryMessages.WiFi(ssid: "Test", password: "", channel: 0))
+     }
+     func testSessionPortUsesUInt32EncodingAndNestedAddress() throws {
+-        let message = try AccessoryMessages.startSession(address: "127.0.0.1", port: 51962, deviceID: "02:03:04:05:06:07")
++        let key = String(repeating: "ab", count: 32)
++        let message = try AccessoryMessages.startSession(address: "127.0.0.1", port: 51962,
++            deviceID: "02:03:04:05:06:07", publicKey: key)
+         let decoded = try IAP2Message.parse(message.encoded())
+         XCTAssertEqual(decoded.id, 0x4301)
+         let port = try XCTUnwrap(decoded.parameters.first { $0.id == 2 })
+         XCTAssertEqual(port.value, Data([0, 0, 0xca, 0xfa]))
++        XCTAssertEqual(decoded.parameters.first { $0.id == 4 }?.value, Data("\(key)\0".utf8))
+         let group = try XCTUnwrap(decoded.parameters.first { $0.id == 0 })
+         let address = try IAP2Parameter.parse(group.value)
+         XCTAssertEqual(address, [.init(id: 0, value: Data("127.0.0.1\0".utf8))])
+         XCTAssertNil(decoded.parameters.first { $0.id == 1 }, "Local mode must not supply invented Wi-Fi credentials")
+     }
++    func testAccessoryWiFiConfigurationResponse() throws {
++        let wifi = try AccessoryMessages.WiFi(ssid: "CarNet", password: "password1", channel: 44)
++        let message = try AccessoryMessages.accessoryWiFiConfiguration(wifi, bssid: Data([1, 2, 3, 4, 5, 6]))
++        let decoded = try IAP2Message.parse(message.encoded())
++        XCTAssertEqual(decoded.id, 0x5703)
++        XCTAssertEqual(decoded.parameters.first { $0.id == 0 }?.value, Data([1, 2, 3, 4, 5, 6]))
++        XCTAssertEqual(decoded.parameters.first { $0.id == 1 }?.value, Data("CarNet\0".utf8))
++        XCTAssertEqual(decoded.parameters.first { $0.id == 2 }?.value, Data("password1\0".utf8))
++        XCTAssertEqual(decoded.parameters.first { $0.id == 3 }?.value, Data([2]))
++        XCTAssertEqual(decoded.parameters.first { $0.id == 4 }?.value, Data([44]))
++    }
+     func testIdentificationTransportIDsAndBluetoothAddress() throws {
+         let message = try AccessoryMessages.identification(name: "Test", deviceID: "02:03:04:05:06:07")
+         for (groupID, transportID) in [(UInt16(16), UInt8(1)), (17, 2), (24, 3)] {
