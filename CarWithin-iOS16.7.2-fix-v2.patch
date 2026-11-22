@@ -226,7 +226,7 @@
 +            deviceID: configuration.deviceID, wifi: wifi, publicKey: airPlayPublicKey)
 +        if !loggedStartRequest {
 +            loggedStartRequest = true
-+            onLog?("CarPlayStartSession 内容：" + message.encoded().map { String(format: "%02x", $0) }.joined())
++            onLog?("CarPlayStartSession 内容：" + (try message.encoded()).map { String(format: "%02x", $0) }.joined())
 +        }
 +        try send(message)
      }
