@@ -23,7 +23,7 @@ jobs:
       - name: Apply iOS 16.7.2 fix patch
         working-directory: src
         run: |
-          git apply -v ../kit/CarWithin-iOS16.7.2-fix-v3.patch
+          git apply -v ../kit/CarWithin-iOS16.7.2-fix-v4.patch
           git --no-pager diff --stat
 
       - name: Show toolchain
@@ -76,12 +76,12 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/stage/Payload"
           cp -R "$APP" "$GITHUB_WORKSPACE/stage/Payload/"
           cd "$GITHUB_WORKSPACE/stage"
-          zip -qry ../CarWithin-1.0.3-iOS16-v3-unsigned.ipa Payload
-          ls -l ../CarWithin-1.0.3-iOS16-v3-unsigned.ipa
+          zip -qry ../CarWithin-1.0.3-iOS16-v4-unsigned.ipa Payload
+          ls -l ../CarWithin-1.0.3-iOS16-v4-unsigned.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CarWithin-1.0.3-iOS16-v3-unsigned
-          path: CarWithin-1.0.3-iOS16-v3-unsigned.ipa
+          name: CarWithin-1.0.3-iOS16-v4-unsigned
+          path: CarWithin-1.0.3-iOS16-v4-unsigned.ipa
           if-no-files-found: error
