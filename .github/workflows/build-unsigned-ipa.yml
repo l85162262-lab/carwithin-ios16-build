@@ -1,0 +1,78 @@
+name: Build CarWithin IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout build repo (holds the patch)
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Checkout upstream CarWithin source
+        uses: actions/checkout@v4
+        with:
+          repository: xmz28/CarWithin
+          ref: main
+          path: src
+
+      - name: Apply iOS 16.7.2 fix patch
+        working-directory: src
+        run: |
+          git apply -v ../kit/CarWithin-iOS16.7.2-fix.patch
+          git --no-pager diff --stat
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Build device target without signing
+        working-directory: src
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TDSCarKit.xcodeproj \
+            -scheme TDSCarKit \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Inject MFi identity from the official IPA
+        run: |
+          set -euo pipefail
+          curl -sL -o "$GITHUB_WORKSPACE/official.ipa" "https://github.com/xmz28/CarWithin/releases/download/v1.0.3/CarWithin-1.0.3-unsigned.ipa"
+          mkdir -p "$GITHUB_WORKSPACE/ref"
+          unzip -q "$GITHUB_WORKSPACE/official.ipa" -d "$GITHUB_WORKSPACE/ref"
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          for f in certificate.p7b leaf.cer private.x963; do
+            cp "$GITHUB_WORKSPACE/ref/Payload/TDSCarKit.app/$f" "$APP/"
+          done
+          ls -l "$APP"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          rm -rf "$GITHUB_WORKSPACE/stage"
+          mkdir -p "$GITHUB_WORKSPACE/stage/Payload"
+          cp -R "$APP" "$GITHUB_WORKSPACE/stage/Payload/"
+          cd "$GITHUB_WORKSPACE/stage"
+          zip -qry ../CarWithin-1.0.3-iOS16-unsigned.ipa Payload
+          ls -l ../CarWithin-1.0.3-iOS16-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarWithin-1.0.3-iOS16-unsigned
+          path: CarWithin-1.0.3-iOS16-unsigned.ipa
+          if-no-files-found: error
