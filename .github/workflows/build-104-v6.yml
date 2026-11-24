@@ -1,0 +1,148 @@
+name: Build CarWithin 1.0.4 v6
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Fetch upstream source
+        run: |
+          set -euo pipefail
+          curl -sL -o src.zip https://github.com/xmz28/CarWithin/archive/refs/tags/v1.0.4.zip
+          unzip -q src.zip
+          mv CarWithin-1.0.4 src
+
+      - name: Fetch MFi identity into source tree
+        run: |
+          set -euo pipefail
+          curl -sL -o official.ipa https://github.com/xmz28/CarWithin/releases/download/v1.0.4/CarWithin-1.0.4-unsigned.ipa
+          unzip -q official.ipa -d ref
+          mkdir -p src/App/BundledIdentity
+          for f in certificate.p7b leaf.cer private.x963; do
+            cp "ref/Payload/TDSCarKit.app/$f" "src/App/BundledIdentity/$f"
+          done
+          ls -l src/App/BundledIdentity
+
+      - name: Patch v6 audio capability and announcement tolerance
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          changed = []
+
+          # ---- 1. 仪表模式启用音频能力（features/audioFormats/audio resource 都随之打开）
+          p = Path('src/App/ReceiverViewController.swift')
+          s = p.read_text(encoding='utf-8')
+          old = 'audioEnabled: soundOutput != .phone'
+          n = s.count(old)
+          assert n == 2, f'audio sites = {n}'
+          s = s.replace(old, 'audioEnabled: true')
+          p.write_text(s, encoding='utf-8')
+          changed.append(f'ReceiverViewController audioEnabled sites: {n}')
+
+          # ---- 2. 公告通道失败不再中止整个会话；日志带上仪表 IP
+          p = Path('src/App/TailingConnection.swift')
+          s = p.read_text(encoding='utf-8')
+
+          old_log = '        log("\\(dashboard) TCP 已监听 \\(localIP):\\(ports.control)/\\(ports.auxiliary)/\\(ports.video)，正在协商")'
+          new_log = '        log("\\(dashboard) TCP 已监听 \\(localIP):\\(ports.control)/\\(ports.auxiliary)/\\(ports.video)，仪表 \\(targetIP)，正在协商")'
+          assert s.count(old_log) == 1, 'listen log line missing'
+          s = s.replace(old_log, new_log)
+
+          old_block = '''        try announcement.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)
+                  try announcement.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
+                      "phoneType": "iOS", "packageName": phone.package
+                  ])))
+                  let reply = try TailingProtocol.readControl { try announcement.readExactly($0, timeout: 3) }
+                  guard reply.command == 0x70000011,
+                        try TailingProtocol.object(reply.payload)["status"] as? Bool == true else {
+                      throw TailingError.protocolFailure("仪表未接受 iOS 投屏请求")
+                  }'''
+
+          new_block = '''        do {
+                      try announcement.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)
+                      try announcement.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
+                          "phoneType": "iOS", "packageName": phone.package
+                      ])))
+                      let reply = try TailingProtocol.readControl { try announcement.readExactly($0, timeout: 3) }
+                      guard reply.command == 0x70000011,
+                            try TailingProtocol.object(reply.payload)["status"] as? Bool == true else {
+                          throw TailingError.protocolFailure("仪表未接受 iOS 投屏请求")
+                      }
+                  } catch {
+                      log("\\(dashboard) 公告通道 \\(targetIP):\\(ports.announcement) 未接通（\\(error)），继续等待仪表回连")
+                  }'''
+
+          assert s.count(old_block) == 1, f'announcement block sites = {s.count(old_block)}'
+          s = s.replace(old_block, new_block)
+          p.write_text(s, encoding='utf-8')
+          changed.append('TailingConnection announcement non-fatal + target IP log')
+
+          # ---- 3. 音频编解码预检失败改为告警，不整体 fail
+          p = Path('src/App/NativeReceiver.swift')
+          s = p.read_text(encoding='utf-8')
+          old = '                } catch { self.fail("无线音频编解码器不可用：\\(error.localizedDescription)"); return }'
+          new = '                } catch { self.log("音频编解码器预检失败，继续尝试：\\(error.localizedDescription)") }'
+          assert s.count(old) == 1, f'audio preflight sites = {s.count(old)}'
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8')
+          changed.append('NativeReceiver audio preflight non-fatal')
+
+          print('PATCHED')
+          for c in changed:
+              print(' -', c)
+          PY
+          grep -n 'audioEnabled: true' src/App/ReceiverViewController.swift
+          grep -n '公告通道' src/App/TailingConnection.swift
+          grep -n '音频编解码器预检失败' src/App/NativeReceiver.swift
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Build without signing
+        working-directory: src
+        run: |
+          set -o pipefail
+          xcodebuild -project TDSCarKit.xcodeproj -scheme TDSCarKit -configuration Release \
+            -destination 'generic/platform=iOS' -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
+
+      - name: Surface compile errors
+        if: always()
+        run: |
+          grep -E 'error:' "$GITHUB_WORKSPACE/build.log" | head -n 30 || true
+
+      - name: Verify bundled identity
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          for f in certificate.p7b leaf.cer private.x963; do
+            test -s "$APP/$f" || cp "ref/Payload/TDSCarKit.app/$f" "$APP/$f"
+          done
+          ls -l "$APP" | head -n 20
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          rm -rf stage
+          mkdir -p stage/Payload
+          cp -R "$APP" stage/Payload/
+          cd stage
+          zip -qry ../CarWithin-1.0.4-iOS16-v6-unsigned.ipa Payload
+          ls -l ../CarWithin-1.0.4-iOS16-v6-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarWithin-1.0.4-iOS16-v6-unsigned
+          path: CarWithin-1.0.4-iOS16-v6-unsigned.ipa
+          if-no-files-found: error
