@@ -1,0 +1,87 @@
+name: Build CarWithin 1.0.4 v5
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Fetch upstream source
+        run: |
+          set -euo pipefail
+          curl -sL -o src.zip https://github.com/xmz28/CarWithin/archive/refs/tags/v1.0.4.zip
+          unzip -q src.zip
+          mv CarWithin-1.0.4 src
+
+      - name: Patch RECORD keyframe warm-up
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/App/NativeReceiver.swift')
+          s = p.read_text(encoding='utf-8')
+          old = '            log("已接受 CarPlay RECORD，正在等待视频")\n            return RTSPResponse()'
+          if s.count(old) == 0:
+              old = '            log("已接受 CarPlay RECORD，正在等待视频")\r\n            return RTSPResponse()'
+          assert s.count(old) == 1, 'pattern missing'
+          nl = '\r\n' if '\r\n' in s else '\n'
+          new = nl.join([
+              '            log("已接受 CarPlay RECORD，正在等待视频")',
+              '            requestKeyFrame(reason: "会话启动预热")',
+              '            queue.asyncAfter(deadline: .now() + 3) { [weak self] in',
+              '                self?.requestKeyFrame(reason: "会话启动预热重试")',
+              '            }',
+              '            return RTSPResponse()',
+          ])
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          print('patched')
+          PY
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Build without signing
+        working-directory: src
+        run: |
+          set -o pipefail
+          xcodebuild -project TDSCarKit.xcodeproj -scheme TDSCarKit -configuration Release \
+            -destination 'generic/platform=iOS' -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
+
+      - name: Surface compile errors
+        if: failure()
+        run: |
+          grep 'error:' "$GITHUB_WORKSPACE/build.log" | head -n 30 || true
+
+      - name: Inject MFi identity
+        run: |
+          set -euo pipefail
+          curl -sL -o official.ipa https://github.com/xmz28/CarWithin/releases/download/v1.0.4/CarWithin-1.0.4-unsigned.ipa
+          unzip -q official.ipa -d ref
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          for f in certificate.p7b leaf.cer private.x963; do cp "ref/Payload/TDSCarKit.app/$f" "$APP/"; done
+          ls -l "$APP"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          rm -rf stage
+          mkdir -p stage/Payload
+          cp -R "$APP" stage/Payload/
+          cd stage
+          zip -qry ../CarWithin-1.0.4-iOS16-v5-unsigned.ipa Payload
+          ls -l ../CarWithin-1.0.4-iOS16-v5-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarWithin-1.0.4-iOS16-v5-unsigned
+          path: CarWithin-1.0.4-iOS16-v5-unsigned.ipa
+          if-no-files-found: error
