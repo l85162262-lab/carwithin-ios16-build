@@ -15,6 +15,17 @@ jobs:
           unzip -q src.zip
           mv CarWithin-1.0.4 src
 
+      - name: Fetch MFi identity into source tree
+        run: |
+          set -euo pipefail
+          curl -sL -o official.ipa https://github.com/xmz28/CarWithin/releases/download/v1.0.4/CarWithin-1.0.4-unsigned.ipa
+          unzip -q official.ipa -d ref
+          mkdir -p src/App/BundledIdentity
+          for f in certificate.p7b leaf.cer private.x963; do
+            cp "ref/Payload/TDSCarKit.app/$f" "src/App/BundledIdentity/$f"
+          done
+          ls -l src/App/BundledIdentity
+
       - name: Patch RECORD keyframe warm-up
         run: |
           set -euo pipefail
@@ -38,6 +49,7 @@ jobs:
           p.write_text(s.replace(old, new), encoding='utf-8')
           print('patched')
           PY
+          grep -n '会话启动预热' src/App/NativeReceiver.swift
 
       - name: Show toolchain
         run: |
@@ -55,18 +67,18 @@ jobs:
             build 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
 
       - name: Surface compile errors
-        if: failure()
+        if: always()
         run: |
-          grep 'error:' "$GITHUB_WORKSPACE/build.log" | head -n 30 || true
+          grep -E 'error:' "$GITHUB_WORKSPACE/build.log" | head -n 30 || true
 
-      - name: Inject MFi identity
+      - name: Verify bundled identity
         run: |
           set -euo pipefail
-          curl -sL -o official.ipa https://github.com/xmz28/CarWithin/releases/download/v1.0.4/CarWithin-1.0.4-unsigned.ipa
-          unzip -q official.ipa -d ref
           APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
-          for f in certificate.p7b leaf.cer private.x963; do cp "ref/Payload/TDSCarKit.app/$f" "$APP/"; done
-          ls -l "$APP"
+          for f in certificate.p7b leaf.cer private.x963; do
+            test -s "$APP/$f" || cp "ref/Payload/TDSCarKit.app/$f" "$APP/$f"
+          done
+          ls -l "$APP" | head -n 20
 
       - name: Package unsigned IPA
         run: |
