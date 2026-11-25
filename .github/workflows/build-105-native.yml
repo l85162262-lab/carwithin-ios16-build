@@ -1,0 +1,310 @@
+name: Build CarWithin 1.0.5 native-audio
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Fetch upstream source
+        run: |
+          set -euo pipefail
+          curl -sL -o src.zip https://github.com/xmz28/CarWithin/archive/refs/tags/v1.0.5.zip
+          unzip -q src.zip
+          mv CarWithin-1.0.5 src
+
+      - name: Fetch MFi identity into source tree
+        run: |
+          set -euo pipefail
+          curl -sL -o official.ipa https://github.com/xmz28/CarWithin/releases/download/v1.0.5/CarWithin-1.0.5-unsigned.ipa
+          unzip -q official.ipa -d ref
+          mkdir -p src/App/BundledIdentity
+          for f in certificate.p7b leaf.cer private.x963; do
+            cp "ref/Payload/TDSCarKit.app/$f" "src/App/BundledIdentity/$f"
+          done
+          ls -l src/App/BundledIdentity
+
+      - name: Patch v10 drop media audio formats, announcement retry and SSID log
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          changed = []
+
+
+          def read(path):
+              return Path(path).read_text(encoding='utf-8')
+
+
+          def write(path, text):
+              Path(path).write_text(text, encoding='utf-8')
+
+
+          # ===== B. 公告通道重试 6 次 + 60 秒等待（现代路径与 6.2 legacy 路径）=====
+          def patch_connection(path, error_expr, indent):
+              s = read(path)
+              start_marker = indent + 'let announcement: TailingSocket'
+              end_marker = indent + 'let deadline = Date().addingTimeInterval(20)'
+              i = s.index(start_marker)
+              j = s.index(end_marker, i)
+              body_indent = indent + '    '
+
+              lines = []
+              lines.append(indent + 'if let discoveredSocket {')
+              lines.append(body_indent + 'let announcement = discoveredSocket')
+              lines.append(body_indent + 'defer { announcement.close() }')
+              lines.append(body_indent + 'try announcement.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([')
+              lines.append(body_indent + '    "phoneType": "iOS", "packageName": phone.package')
+              lines.append(body_indent + '])))')
+              lines.append(body_indent + 'let reply = try TailingProtocol.readControl { try announcement.readExactly($0, timeout: 3) }')
+              lines.append(body_indent + 'guard reply.command == 0x70000011,')
+              lines.append(body_indent + '      try TailingProtocol.object(reply.payload)["status"] as? Bool == true else {')
+              lines.append(body_indent + '    throw TailingError.protocolFailure(' + error_expr + ')')
+              lines.append(body_indent + '}')
+              lines.append(indent + '} else {')
+              lines.append(body_indent + 'var announced = false')
+              lines.append(body_indent + 'for attempt in 1...6 where !announced {')
+              inner = body_indent + '    '
+              lines.append(inner + 'do {')
+              lines.append(inner + '    let announcement = try tracked(TailingSocket.create())')
+              lines.append(inner + '    defer { announcement.close() }')
+              lines.append(inner + '    try announcement.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)')
+              lines.append(inner + '    try announcement.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([')
+              lines.append(inner + '        "phoneType": "iOS", "packageName": phone.package')
+              lines.append(inner + '    ])))')
+              lines.append(inner + '    let reply = try TailingProtocol.readControl { try announcement.readExactly($0, timeout: 3) }')
+              lines.append(inner + '    guard reply.command == 0x70000011,')
+              lines.append(inner + '          try TailingProtocol.object(reply.payload)["status"] as? Bool == true else {')
+              lines.append(inner + '        throw TailingError.protocolFailure(' + error_expr + ')')
+              lines.append(inner + '    }')
+              lines.append(inner + '    announced = true')
+              lines.append(inner + r'    log("\(dashboard) 公告通道 \(targetIP):\(ports.announcement) 已通知仪表开始投屏")')
+              lines.append(inner + '} catch {')
+              lines.append(inner + r'    log("\(dashboard) 公告通道第 \(attempt) 次未接通（\(error.localizedDescription)），2 秒后重试")')
+              lines.append(inner + '    if attempt < 6 { Thread.sleep(forTimeInterval: 2) }')
+              lines.append(inner + '}')
+              lines.append(body_indent + '}')
+              lines.append(indent + '}')
+              lines.append('')
+              new_block = '\n'.join(lines) + '\n'
+              s = s[:i] + new_block + s[j:]
+              s = s.replace(end_marker, indent + 'let deadline = Date().addingTimeInterval(60)')
+              write(path, s)
+
+
+          patch_connection('src/App/TailingConnection.swift', 'CWL("仪表未接受 iOS 投屏请求")', '        ')
+          patched = read('src/App/TailingConnection.swift')
+          old_log = r'log("\(dashboard) TCP 已监听 \(localIP):\(ports.control)/\(ports.auxiliary)/\(ports.video)，正在协商")'
+          new_log = r'log("\(dashboard) TCP 已监听 \(localIP):\(ports.control)/\(ports.auxiliary)/\(ports.video)，仪表 \(targetIP)，正在协商")'
+          assert patched.count(old_log) == 1, 'modern listen log missing'
+          write('src/App/TailingConnection.swift', patched.replace(old_log, new_log))
+
+          patch_connection('src/App/Zeeho62Legacy.swift', '"仪表未接受 iOS 投屏请求"', '            ')
+          legacy = read('src/App/Zeeho62Legacy.swift')
+          assert legacy.count(old_log) == 1, 'legacy listen log missing'
+          write('src/App/Zeeho62Legacy.swift', legacy.replace(old_log, new_log))
+          changed.append('announcement retry x6 + 60s (modern + 62 legacy)')
+
+
+          # ===== C. SSID 日志 + 音频预检容错 =====
+          p = 'src/App/NativeReceiver.swift'
+          s = read(p)
+          old_imports = 'import Foundation\nimport Network\nimport CoreGraphics'
+          new_imports = 'import Foundation\nimport Network\nimport NetworkExtension\nimport CoreGraphics'
+          assert s.count(old_imports) == 1, 'imports missing'
+          s = s.replace(old_imports, new_imports)
+
+          anchor = '            if let target = configuration.zeehoAddress {'
+          insert = '''            if let target = configuration.zeehoAddress {
+                          NEHotspotNetwork.fetchCurrent { [weak self] network in
+                              DispatchQueue.main.async { self?.log("当前 Wi-Fi：\\(network?.ssid ?? "未知（未授权定位）")") }
+                          }'''
+          assert s.count(anchor) == 1, 'zeeho anchor missing'
+          s = s.replace(anchor, insert)
+
+          old_pre = '                } catch { self.fail(CWL("无线音频编解码器不可用：{1}", [String(describing: error.localizedDescription)])); return }'
+          new_pre = '                } catch { self.log(CWL("音频编解码器预检失败，继续尝试：{1}", [String(describing: error.localizedDescription)])) }'
+          assert s.count(old_pre) == 1, 'preflight missing'
+          s = s.replace(old_pre, new_pre)
+          write(p, s)
+          changed.append('SSID log + tolerant preflight')
+
+
+          # ===== D. CarPlayAudio: allowBluetoothA2DP + 优先蓝牙/抢回蓝牙 =====
+          p = 'src/App/CarPlayAudio.swift'
+          s = read(p)
+          old_options = '                var options: AVAudioSession.CategoryOptions = needsDuplexCategory ? [.defaultToSpeaker] : []'
+          new_options = '                var options: AVAudioSession.CategoryOptions = needsDuplexCategory ? [.defaultToSpeaker, .allowBluetoothA2DP] : []'
+          assert s.count(old_options) == 1, 'options missing'
+          s = s.replace(old_options, new_options)
+
+          old_static = '''    private static var playingStreams = 0
+              #if os(iOS)
+              private static var hasSpeakerOverride = false
+              #endif'''
+          new_static = r'''    private static var playingStreams = 0
+              #if os(iOS)
+              private static var hasSpeakerOverride = false
+              private static var bluetoothReclaimAttempted = false
+              private static func routeSummary(_ session: AVAudioSession) -> String {
+                  let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+                  return outputs.isEmpty ? "无" : outputs
+              }
+              #endif'''
+          assert s.count(old_static) == 1, 'static block missing'
+          s = s.replace(old_static, new_static)
+
+          old_full = '''                    if session.category != .playAndRecord {
+                                  try session.setCategory(.playAndRecord, mode: .default, options: options.union(.defaultToSpeaker))
+                              }
+                              do {
+                                  try session.overrideOutputAudioPort(.speaker)
+                                  Self.hasSpeakerOverride = true
+                                  onLog?(CWL("本机音频避开 CarPlay 路由，改用 iPhone 扬声器"))
+                              } catch {
+                                  Self.deactivateSessionIfIdle()
+                                  throw error
+                              }'''
+          new_full = r'''                    onLog?("CarPlay 路由占用，当前输出：\(Self.routeSummary(session))")
+                              var routedToBluetooth = false
+                              if !Self.bluetoothReclaimAttempted {
+                                  Self.bluetoothReclaimAttempted = true
+                                  let reclaimCategory: AVAudioSession.Category = needsDuplexCategory ? .playAndRecord : .playback
+                                  var reclaimOptions: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+                                  if needsDuplexCategory { reclaimOptions.insert(.defaultToSpeaker) }
+                                  if BackgroundKeepAlive.holdsAudioSession { reclaimOptions.insert(.mixWithOthers) }
+                                  do {
+                                      try session.setActive(false, options: .notifyOthersOnDeactivation)
+                                      try session.setCategory(reclaimCategory, mode: .default, options: reclaimOptions)
+                                      try session.setActive(true)
+                                  } catch {
+                                      onLog?("蓝牙接回尝试失败：\(error.localizedDescription)")
+                                  }
+                                  for _ in 0..<20 {
+                                      if session.currentRoute.outputs.contains(where: { $0.portType == .bluetoothA2DP }) {
+                                          routedToBluetooth = true; break
+                                      }
+                                      Thread.sleep(forTimeInterval: 0.1)
+                                  }
+                                  onLog?("蓝牙接回结果：\(routedToBluetooth ? "已接回 A2DP" : "未接回")，当前输出：\(Self.routeSummary(session))")
+                              } else if session.currentRoute.outputs.contains(where: { $0.portType == .bluetoothA2DP }) {
+                                  routedToBluetooth = true
+                              }
+                              if routedToBluetooth {
+                                  Self.hasSpeakerOverride = false
+                                  onLog?("本机音频改走蓝牙 A2DP，跳过扬声器覆盖")
+                              } else {
+                                  if session.category != .playAndRecord {
+                                      try session.setCategory(.playAndRecord, mode: .default, options: options.union(.defaultToSpeaker))
+                                  }
+                                  do {
+                                      try session.overrideOutputAudioPort(.speaker)
+                                      Self.hasSpeakerOverride = true
+                                      onLog?("本机音频避开 CarPlay 路由，改用 iPhone 扬声器")
+                                  } catch {
+                                      Self.deactivateSessionIfIdle()
+                                      throw error
+                                  }
+                              }'''
+          assert s.count(old_full) == 1, f'audio branch sites = {s.count(old_full)}'
+          s = s.replace(old_full, new_full)
+          write(p, s)
+          changed.append('A2DP allow + reclaim')
+
+
+          # ===== E. CarPlayInfo: 去掉 media 音频格式 =====
+          p = 'src/App/CarPlayInfo.swift'
+          s = read(p)
+
+          old_types = '''            let types: [(Int, String)] = [(100,"compatibility"),(101,"compatibility"),(100,"default"),
+                          (100,"media"),(100,"alert"),(100,"telephony"),(100,"speechRecognition"),(101,"default")]'''
+          new_types = '''            let types: [(Int, String)] = [(100,"compatibility"),(101,"compatibility"),(100,"default"),
+                          (100,"alert"),(100,"telephony"),(100,"speechRecognition"),(101,"default")]'''
+          assert s.count(old_types) == 1, 'types missing'
+          s = s.replace(old_types, new_types)
+
+          old_profiles = '''                (100, "default", 0x30000050, 0x30000050),
+                          (100, "media", 0x8800, 0),
+                          (100, "alert", 0x40008800, 0),
+                          (100, "telephony", 0x70000150, 0x70000150),
+                          (100, "speechRecognition", 0x20000040, 0x20000040),
+                          (101, "default", 0x40008800, 0),
+                          (102, "media", 0xc00000, 0)'''
+          new_profiles = '''                (100, "default", 0x30000050, 0x30000050),
+                          (100, "alert", 0x40008800, 0),
+                          (100, "telephony", 0x70000150, 0x70000150),
+                          (100, "speechRecognition", 0x20000040, 0x20000040),
+                          (101, "default", 0x40008800, 0)'''
+          assert s.count(old_profiles) == 1, 'profiles missing'
+          s = s.replace(old_profiles, new_profiles)
+
+          old_lat = '''            info["audioLatencies"] = (types + [(102,"media"),(102,"default")]).map { ["type": $0.0, "audioType": $0.1, "inputLatencyMicros": 0, "outputLatencyMicros": $0.0 == 102 ? 200000 : 50000] as [String: Any] }
+                          + [100, 101, 102].map { ["type": $0, "inputLatencyMicros": 0, "outputLatencyMicros": $0 == 102 ? 200000 : 50000] as [String: Any] }'''
+          new_lat = '''            info["audioLatencies"] = types.map { ["type": $0.0, "audioType": $0.1, "inputLatencyMicros": 0, "outputLatencyMicros": 50000] as [String: Any] }
+                          + [100, 101].map { ["type": $0, "inputLatencyMicros": 0, "outputLatencyMicros": 50000] as [String: Any] }'''
+          assert s.count(old_lat) == 1, 'latency missing'
+          s = s.replace(old_lat, new_lat)
+          write(p, s)
+          changed.append('drop media audio formats')
+
+          print('PATCHED 1.0.5')
+          for c in changed:
+              print(' -', c)
+
+          PY
+          grep -n 'audioEnabled: soundOutput != .phone' src/App/ReceiverViewController.swift
+          grep -n '公告通道第' src/App/TailingConnection.swift
+          grep -n '当前 Wi-Fi' src/App/NativeReceiver.swift
+          grep -n '公告通道第' src/App/Zeeho62Legacy.swift
+          grep -n '蓝牙接回结果' src/App/CarPlayAudio.swift
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Build without signing
+        working-directory: src
+        run: |
+          set -o pipefail
+          xcodebuild -project TDSCarKit.xcodeproj -scheme TDSCarKit -configuration Release \
+            -destination 'generic/platform=iOS' -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
+
+      - name: Surface compile errors
+        if: always()
+        run: |
+          grep -E 'error:' "$GITHUB_WORKSPACE/build.log" | head -n 30 || true
+
+      - name: Verify bundled identity
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          for f in certificate.p7b leaf.cer private.x963; do
+            test -s "$APP/$f" || cp "ref/Payload/TDSCarKit.app/$f" "$APP/$f"
+          done
+          ls -l "$APP" | head -n 20
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n1)"
+          rm -rf stage
+          mkdir -p stage/Payload
+          cp -R "$APP" stage/Payload/
+          cd stage
+          zip -qry ../CarWithin-1.0.5-iOS16-native-unsigned.ipa Payload
+          ls -l ../CarWithin-1.0.5-iOS16-native-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarWithin-1.0.5-iOS16-native-unsigned
+          path: CarWithin-1.0.5-iOS16-native-unsigned.ipa
+          if-no-files-found: error
